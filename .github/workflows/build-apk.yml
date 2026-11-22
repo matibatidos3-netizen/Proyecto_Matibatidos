@@ -11,11 +11,15 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: matibatidos-rc6-build-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Validar y compilar Matibatidos RC6
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     steps:
       - name: Descargar repositorio
@@ -27,19 +31,50 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Configurar Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Preparar Android SDK sin acción externa de setup
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if [[ ! -d "$SDK_ROOT" ]]; then
+            echo "::error::No se encontró el Android SDK preinstalado en: $SDK_ROOT"
+            exit 1
+          fi
 
-      - name: Verificar y extraer el proyecto RC6
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "::error::No se encontró sdkmanager dentro de $SDK_ROOT/cmdline-tools"
+            find "$SDK_ROOT" -maxdepth 4 -type f -name sdkmanager -print || true
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "SDK encontrado: $SDK_ROOT"
+          echo "sdkmanager: $SDKMANAGER"
+
+          # Aceptar licencias sin hacer fallar el paso por el código de salida de yes.
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+          set -o pipefail
+
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "platform-tools"
+
+          test -x "$SDK_ROOT/build-tools/35.0.0/aapt"
+          test -x "$SDK_ROOT/build-tools/35.0.0/apksigner"
+
+      - name: Localizar y extraer el proyecto RC6
         id: project
         shell: bash
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
           ZIP="Matibatidos_RC6_EXCEL_RENDIMIENTO_CORREGIDO.zip"
-
           if [[ ! -s "$ZIP" ]]; then
-            echo "::error::No se encontró '$ZIP' en la raíz del repositorio. Revisa el nombre exacto y vuelve a subir el ZIP."
-            echo "Archivos disponibles en la raíz:"
+            echo "::error::No se encontró '$ZIP' en la raíz del repositorio. Comprueba el nombre exacto."
             ls -lah
             exit 1
           fi
@@ -48,69 +83,80 @@ jobs:
           mkdir -p extracted_rc6
           unzip -q "$ZIP" -d extracted_rc6
 
-          mapfile -t SETTINGS_FILES < <(find extracted_rc6 -type f -name settings.gradle -not -path '*/.git/*')
+          mapfile -t SETTINGS_FILES < <(find extracted_rc6 -type f -name settings.gradle -not -path '*/.git/*' | sort)
           if [[ ${#SETTINGS_FILES[@]} -ne 1 ]]; then
-            echo "::error::El ZIP debe contener exactamente un settings.gradle; encontrados: ${#SETTINGS_FILES[@]}."
-            find extracted_rc6 -maxdepth 4 -type f | sort | head -200
+            echo "::error::Se esperaba exactamente un settings.gradle; se encontraron ${#SETTINGS_FILES[@]}."
+            find extracted_rc6 -maxdepth 5 -type f | sort | head -200
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "${SETTINGS_FILES[0]}")"
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "Proyecto detectado: $PROJECT_DIR"
+          echo "Proyecto localizado en: $PROJECT_DIR"
 
-      - name: Validar Firebase, estructura y versión
+      - name: Validar estructura, Firebase y FCM
         working-directory: ${{ steps.project.outputs.project_dir }}
         shell: bash
         run: |
-          set -Eeuo pipefail
-          for f in settings.gradle build.gradle gradle.properties app/build.gradle \
-                   app/google-services.json app/src/main/AndroidManifest.xml \
-                   app/src/main/assets/index.html \
-                   app/src/main/java/com/matibatidos/pos/rc6/MainActivity.java \
-                   app/src/main/java/com/matibatidos/pos/rc6/MatiFirebaseMessagingService.java \
-                   Api_Matibatidos_Delivery.gs; do
-            [[ -s "$f" ]] || { echo "::error::Falta el archivo requerido: $f"; exit 1; }
+          set -euo pipefail
+          REQUIRED_FILES=(
+            settings.gradle
+            build.gradle
+            gradle.properties
+            app/build.gradle
+            app/google-services.json
+            app/src/main/AndroidManifest.xml
+            app/src/main/assets/index.html
+            app/src/main/java/com/matibatidos/pos/rc6/MainActivity.java
+            app/src/main/java/com/matibatidos/pos/rc6/MatiFirebaseMessagingService.java
+            Api_Matibatidos_Delivery.gs
+          )
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [[ ! -s "$file" ]]; then
+              echo "::error::Falta el archivo requerido: $file"
+              exit 1
+            fi
           done
 
           grep -Fq "applicationId 'com.matibatidos.pos.rc6'" app/build.gradle || {
-            echo "::error::El applicationId no coincide con el paquete RC6 esperado."; exit 1;
+            echo "::error::El applicationId no coincide con el paquete RC6."; exit 1;
           }
           grep -Fq "id 'com.google.gms.google-services'" app/build.gradle || {
             echo "::error::Falta el plugin Google Services."; exit 1;
           }
-          grep -Fq "com.google.firebase:firebase-messaging" app/build.gradle || {
+          grep -Fq 'com.google.firebase:firebase-messaging' app/build.gradle || {
             echo "::error::Falta Firebase Messaging."; exit 1;
           }
           grep -Fq 'MatiFirebaseMessagingService' app/src/main/AndroidManifest.xml || {
-            echo "::error::No está declarado el servicio de notificaciones."; exit 1;
+            echo "::error::No está declarado el servicio FCM en AndroidManifest.xml."; exit 1;
           }
 
           python3 - <<'PY'
           import json
-          p = 'app/google-services.json'
-          with open(p, encoding='utf-8') as f:
+          path = 'app/google-services.json'
+          with open(path, encoding='utf-8') as f:
               cfg = json.load(f)
           info = cfg.get('project_info', {})
           if info.get('project_id') != 'matibatidos-online':
-              raise SystemExit('ERROR: google-services.json no pertenece a matibatidos-online')
+              raise SystemExit('ERROR: google-services.json no corresponde a matibatidos-online')
           if str(info.get('project_number')) != '390868871532':
-              raise SystemExit('ERROR: project_number no coincide con Firebase Matibatidos')
+              raise SystemExit('ERROR: project_number no coincide con Firebase')
           packages = [
               c.get('client_info', {}).get('android_client_info', {}).get('package_name')
               for c in cfg.get('client', [])
           ]
           if 'com.matibatidos.pos.rc6' not in packages:
-              raise SystemExit('ERROR: Firebase no contiene el paquete com.matibatidos.pos.rc6')
-          print('Firebase verificado: proyecto y paquete Android coinciden.')
+              raise SystemExit('ERROR: el JSON no contiene el paquete com.matibatidos.pos.rc6')
+          print('Firebase verificado: proyecto, número y paquete coinciden.')
           PY
 
-      - name: Preparar bibliotecas web usadas por el POS
+      - name: Preparar bibliotecas web para Excel y gráficos
         working-directory: ${{ steps.project.outputs.project_dir }}
         shell: bash
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
           ASSETS="app/src/main/assets"
+          mkdir -p "$ASSETS"
           curl --fail --location --retry 3 --retry-delay 2 \
             "https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js" \
             --output "$ASSETS/xlsx.full.min.js"
@@ -119,41 +165,41 @@ jobs:
             --output "$ASSETS/chart.umd.min.js"
           test -s "$ASSETS/xlsx.full.min.js"
           test -s "$ASSETS/chart.umd.min.js"
-          echo "Bibliotecas Excel y gráficos preparadas."
-
-      - name: Instalar componentes Android requeridos
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "platform-tools"
-          yes | sdkmanager --licenses >/dev/null || true
+          echo "Bibliotecas Excel y gráficos listas."
 
       - name: Configurar Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Compilar APK
+      - name: Comprobar herramientas y compilar APK
         working-directory: ${{ steps.project.outputs.project_dir }}
         shell: bash
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
+          java -version
+          gradle --version
           gradle --no-daemon --stacktrace clean assembleDebug
 
-      - name: Verificar APK y paquete
+      - name: Verificar APK generada
         id: apk
         working-directory: ${{ steps.project.outputs.project_dir }}
         shell: bash
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
           APK="app/build/outputs/apk/debug/app-debug.apk"
-          [[ -s "$APK" ]] || { echo "::error::Gradle terminó sin generar la APK esperada."; exit 1; }
+          if [[ ! -s "$APK" ]]; then
+            echo "::error::Gradle terminó, pero no se encontró la APK esperada: $APK"
+            find app/build/outputs -maxdepth 6 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | grep -F "package: name='com.matibatidos.pos.rc6'"
           sha256sum "$APK"
           echo "apk_path=$APK" >> "$GITHUB_OUTPUT"
 
-      - name: Publicar APK
+      - name: Publicar APK para descargar
         uses: actions/upload-artifact@v4
         with:
           name: Matibatidos-POS-RC6-FCM-1.2.5
